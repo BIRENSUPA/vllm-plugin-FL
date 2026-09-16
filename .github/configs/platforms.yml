@@ -27,10 +27,10 @@ platforms:
   hygon:
     enabled: true
   metax:
-    enabled: false
+    enabled: true
   musa:
     enabled: false
   enflame:
-    enabled: false
+    enabled: true
   kunlunxin:
     enabled: false
