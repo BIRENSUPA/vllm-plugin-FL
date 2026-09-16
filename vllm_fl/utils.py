@@ -51,6 +51,8 @@ VENDOR_DEVICE_MAP: dict[str, dict[str, str]] = {
     "thead": {"device_type": "cuda", "device_name": "thead"},
     # Registered backend: vendor/thead (tsingmicro)
     "tsingmicro": {"device_type": "tsingmicro", "device_name": "txda"},
+    # Registered backend: vendor/supa
+    "biren": {"device_type": "cuda", "device_name": "supa"},
 }
 
 # Keep the vLLM base-class no-op for platforms not validated by this change.
