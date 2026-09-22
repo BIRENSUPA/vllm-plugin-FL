@@ -275,6 +275,7 @@ class DeviceInfo:
             "gcu",
             "enflame",
             "kunlunxin",
+            "biren",
         ]
         backend.set_torch_backend_device_fn(self.device.vendor_name)
 
