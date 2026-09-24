@@ -431,6 +431,7 @@ class PlatformFL(Platform):
             "gcu",
             "enflame",
             "kunlunxin",
+            "biren",
         ]:
             return True
         return False
