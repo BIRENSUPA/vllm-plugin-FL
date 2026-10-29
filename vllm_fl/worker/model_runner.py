@@ -45,10 +45,10 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
+    GraphCaptureContext,
     get_dcp_group,
     get_pp_group,
     get_tp_group,
-    GraphCaptureContext,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
@@ -169,6 +169,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
+    PIN_MEMORY,
     get_dtype_size,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
@@ -255,8 +256,6 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.utils.torch_utils import PIN_MEMORY
-
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -266,16 +265,15 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
-
 from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
+    is_residual_scattered_for_sp,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
+from vllm.v1.worker.workspace import lock_workspace
 
 # FL-specific imports
 from vllm_fl.compat.kv_cache import bind_kv_cache
@@ -294,7 +292,20 @@ from vllm_fl.worker.common_attention_metadata import (
 )
 from vllm_fl.worker.model_state import ModelRunnerState
 
-GraphWrapper = GraphWrapper
+
+def _decoder_graph_wrappers():
+    """Return every decoder graph wrapper used by the CUDA runner."""
+    return list(GraphWrapper._all_instances) + list(
+        BreakableCUDAGraphWrapper._all_instances
+    )
+
+
+def _clear_decoder_graphs(runtime=None) -> None:
+    if runtime is not None:
+        runtime.clear_decoder_graphs()
+    else:
+        GraphWrapper.clear_all_graphs()
+    BreakableCUDAGraphWrapper.clear_all_graphs()
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -6689,6 +6700,7 @@ class ModelRunnerFL(
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
             GraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
@@ -6836,6 +6848,18 @@ class ModelRunnerFL(
             if instance.graph_pool is not None:
                 instance.graph_pool = profiling_pool
 
+        # The common-attention metadata producer captures its own graphs before
+        # the decoder wrapper is entered.  Keep those profiling graphs in the
+        # same temporary pool as the decoder graphs.  If they use the global
+        # runtime pool here, the profiling cleanup drops the last graph owning
+        # that pool; the first real decoder capture then reuses a zero-refcount
+        # CachingHostAllocator pool and aborts in capture_begin().
+        metadata_graph = self.common_attention_metadata_graph
+        original_metadata_pool = None
+        if metadata_graph is not None:
+            original_metadata_pool = metadata_graph.graph_pool
+            metadata_graph.graph_pool = profiling_pool
+
         shared_memory_estimate = {}
         per_graph_estimate = {}
         private_memory_estimate = 0
@@ -6919,17 +6943,10 @@ class ModelRunnerFL(
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
-            if self.graph_runtime is not None:
-                self.graph_runtime.clear_decoder_graphs()
-            else:
-                GraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
+            _clear_decoder_graphs(getattr(self, "graph_runtime", None))
             if encoder_cudagraph_manager is not None:
                 encoder_cudagraph_manager.clear()
-            all_wrappers = list(GraphWrapper._all_instances) + list(
-                BreakableCUDAGraphWrapper._all_instances
-            )
-            for instance in all_wrappers:
+            for instance in _decoder_graph_wrappers():
                 if id(instance) in original_pools:
                     instance.graph_pool = original_pools[id(instance)]
             for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
@@ -6937,6 +6954,8 @@ class ModelRunnerFL(
             self.cudagraph_dispatcher.keys_initialized = False
             self.maybe_remove_all_loras(self.lora_config)
             self._cleanup_profiling_kv_cache()
+            if metadata_graph is not None:
+                metadata_graph.graph_pool = original_metadata_pool
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # Overlay shared-pool modes, but add private Breakable pools: neither their
@@ -7529,6 +7548,7 @@ class ModelRunnerFL(
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
 
+
         # Map layer names to (offset, block_stride) within the packed
         # backing tensor so we can create strided views per layer.
         layer_packing: dict[str, tuple[int, int]] = {}
@@ -7556,16 +7576,21 @@ class ModelRunnerFL(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
-                    )
-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
+                    layout = get_physical_cache_layout(attn_backend, kv_cache_spec)
+                    if layout is not None:
+                        num_blocks_per_kv_block = layout.pages_per_block
+                        shape_block_size = layout.kernel_block_size
                     else:
-                        shape_block_size = kernel_block_size
+                        num_blocks_per_kv_block = (
+                            kv_cache_spec.block_size // kernel_block_size
+                        )
+                        shape_block_size = (
+                            kv_cache_spec.storage_block_size
+                            if kv_cache_spec.storage_block_size != kv_cache_spec.block_size
+                            else kernel_block_size
+                        )
+                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
@@ -7587,9 +7612,38 @@ class ModelRunnerFL(
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     raw_tensor = kv_cache_raw_tensors[layer_name]
+                    # A padded logical cache block can be split into multiple
+                    # backend blocks (for example, GLM5-Next uses a 192-token
+                    # logical DSA indexer block and the indexer kernel consumes
+                    # 64-token blocks).  The upstream v0.24 helper applies the
+                    # complete logical-page stride to every backend block,
+                    # which makes the strided view run past the allocation.
+                    # Divide the physical page evenly across the backend blocks
+                    # so flattened kernel block ids retain a constant stride.
+                    reshape_spec = kv_cache_spec
+                    if (
+                        layout is not None
+                        and packing is None
+                        and kv_cache_spec.page_size_padded is not None
+                        and num_blocks_per_kv_block > 1
+                    ):
+                        assert (
+                            kv_cache_spec.page_size_bytes
+                            % num_blocks_per_kv_block
+                            == 0
+                        )
+                        reshape_spec = replace(
+                            kv_cache_spec,
+                            block_size=layout.metadata_block_size,
+                            page_size_padded=(
+                                kv_cache_spec.page_size_bytes
+                                // num_blocks_per_kv_block
+                            ),
+                        )
+
                     kv_caches[layer_name] = _reshape_attention_kv_cache(
                         raw_tensor,
-                        kv_cache_spec,
+                        reshape_spec,
                         kv_cache_shape,
                         kv_cache_stride_order,
                         kernel_num_blocks,
