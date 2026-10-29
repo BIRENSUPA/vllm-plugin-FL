@@ -235,6 +235,16 @@ class PlatformFL(Platform):
             return True
         return self.device_type == "cuda"
 
+    def is_rocm(self) -> bool:
+        """Return whether the OOT platform uses the ROCm/HIP runtime.
+
+        ``PlatformFL`` is registered as ``PlatformEnum.OOT``, so the inherited
+        enum-based implementation cannot classify AMD or Hygon correctly.
+        PyTorch intentionally exposes both through its CUDA-shaped API; keep
+        the vendor boundary explicit instead of inferring it from that API.
+        """
+        return self.vendor_name in ("amd", "hygon")
+
     def is_cuda(self) -> bool:
         """Stateless version of [torch.cuda.is_available][]."""
         return self.device_type == "cuda" and self.vendor_name == "nvidia"
@@ -659,8 +669,28 @@ class PlatformFL(Platform):
 
             patch_triton_chained_or_for_iluvatar()
 
+    @classmethod
     def supports_fp8(cls) -> bool:
-        return cls.vendor_name == "nvidia"
+        if cls.vendor_name == "nvidia":
+            return cls.has_device_capability(89)
+        if cls.vendor_name == "amd":
+            from vllm.platforms.rocm import RocmPlatform
+
+            return RocmPlatform.supports_fp8()
+        # CUDA-compatible runtimes do not imply native FP8 arithmetic.
+        return False
+
+    @classmethod
+    def is_fp8_fnuz(cls) -> bool:
+        if cls.vendor_name == "amd":
+            from vllm.platforms.rocm import RocmPlatform
+
+            return RocmPlatform.is_fp8_fnuz()
+        return False
+
+    @classmethod
+    def fp8_dtype(cls) -> torch.dtype:
+        return torch.float8_e4m3fnuz if cls.is_fp8_fnuz() else torch.float8_e4m3fn
 
     @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:
@@ -668,7 +698,9 @@ class PlatformFL(Platform):
             # Iluvatar is CUDA-compatible but has no NVML library.
             # Return a synthetic UUID based on device index.
             return f"ILUVATAR-{device_id}"
-        if cls.device_type == "cuda":
+        # NVML is NVIDIA-only. ROCm/HIP and other CUDA-alike platforms must
+        # not import it merely because their torch device type is ``cuda``.
+        if cls.device_type == "cuda" and cls.vendor_name == "nvidia":
             import pynvml
 
             pynvml.nvmlInit()
@@ -715,7 +747,9 @@ class PlatformFL(Platform):
                 vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             )
-        return cls.vendor_name in ("nvidia", "thead", "iluvatar")
+        # HIP communicators also use ctypes. Keep them opaque to Dynamo,
+        # matching vLLM's ROCm platform even when is_cuda_alike() is False.
+        return cls.vendor_name in ("nvidia", "amd", "hygon", "thead", "iluvatar")
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
@@ -755,6 +789,8 @@ class PlatformFL(Platform):
 
     @classmethod
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+        if cls.vendor_name != "nvidia" or cls.device_type != "cuda":
+            return False
         try:
             import pynvml
 

@@ -37,11 +37,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -791,17 +794,47 @@ class TestRunner:
         if extra_env_override:
             env.update(extra_env_override)
 
+        case_log_dir = None
+        if (
+            tc.task == "serving"
+            and tc.model
+            and tc.case
+            and not any(
+                arg == "--basetemp" or arg.startswith("--basetemp=") for arg in cmd
+            )
+        ):
+            log_root = (
+                self.output_dir / f"test-results-{self.config.platform}-logs"
+            ).resolve()
+            log_root.mkdir(parents=True, exist_ok=True)
+            case_log_dir = Path(tempfile.mkdtemp(prefix="serving-", dir=log_root))
+            cmd.extend(["--basetemp", str(case_log_dir)])
+
         start = time.time()
-        proc = subprocess.run(
-            cmd,
-            capture_output=_quiet,
-            text=_quiet,
-            cwd=str(_REPO_ROOT),
-            env=env,
-        )
+        with ExitStack() as cleanup:
+            if self.config.platform == "hygon" and tc.task in ("inference", "serving"):
+                # TP workers tune concurrently. Each Python process gets its
+                # own FlagGems SQLite database before importing the provider.
+                # Kernel compilation caches and autotuning remain enabled.
+                env["FLAGGEMS_CACHE_DIR"] = cleanup.enter_context(
+                    tempfile.TemporaryDirectory(prefix="fl-hygon-cache-")
+                )
+                startup = str(_REPO_ROOT / "tests/utils/isolated_cache")
+                env["PYTHONPATH"] = os.pathsep.join(
+                    path for path in (startup, env.get("PYTHONPATH")) if path
+                )
+            proc = subprocess.run(
+                cmd,
+                capture_output=_quiet,
+                text=_quiet,
+                cwd=str(_REPO_ROOT),
+                env=env,
+            )
         duration = time.time() - start
 
         passed = proc.returncode == 0
+        if passed and case_log_dir is not None:
+            shutil.rmtree(case_log_dir)
         message = "" if passed else f"pytest exited with code {proc.returncode}"
 
         return TestResult(
